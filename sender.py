@@ -19,17 +19,36 @@ MUTED     = "#555555"
 FONT_MONO = ("Courier New", 11)
 FONT_UI   = ("Courier New", 10)
 
+# ── ESP32 known VID/PID combos ─────────────────────────────────────────────────
+ESP_VIDS = {
+    0x10C4: "CP2102 (ESP32)",       # Silicon Labs CP2102/CP2104
+    0x1A86: "CH340 (ESP32)",        # CH340/CH341 (cheap boards)
+    0x303A: "ESP32-S3 Native USB",  # ESP32-S3 / S2 native USB
+    0x0403: "FTDI (ESP32)",         # FTDI FT232R
+    0x2341: "Arduino (ESP32)",      # Arduino-compatible
+}
+
+
+def find_esp32_port():
+    """Return (device, description) of first likely ESP32 port, or (None, None)."""
+    for p in serial.tools.list_ports.comports():
+        if p.vid in ESP_VIDS:
+            return p.device, f"{p.device} — {ESP_VIDS[p.vid]}"
+    return None, None
+
+
 class ESP32KeyboardSender:
     def __init__(self, root):
         self.root = root
         self.root.title("ESP32 BLE Keyboard Sender")
         self.root.configure(bg=BG)
-        self.root.geometry("820x640")
+        self.root.geometry("860x660")
         self.root.resizable(True, True)
 
         self.serial_conn = None
         self.is_typing   = False
         self.live_mode   = False
+        self._port_map   = {}   # display label → actual device path
 
         self._build_ui()
         self._refresh_ports()
@@ -56,26 +75,37 @@ class ESP32KeyboardSender:
                  bg=BG, fg=GREEN).pack(side="left")
         tk.Label(hdr, text=" BLE KEYBOARD SENDER", font=("Courier New", 18, "bold"),
                  bg=BG, fg=TEXT).pack(side="left")
-        self.status_dot = tk.Label(hdr, text="●  DISCONNECTED", font=FONT_UI, bg=BG, fg=RED)
+        self.status_dot = tk.Label(hdr, text="●  DISCONNECTED",
+                                    font=FONT_UI, bg=BG, fg=RED)
         self.status_dot.pack(side="right")
 
         tk.Frame(self.root, bg=BORDER, height=1).pack(fill="x", padx=20, pady=8)
 
         # ── Port row ──
         port_row = tk.Frame(self.root, bg=BG)
-        port_row.pack(fill="x", padx=20, pady=(0, 4))
+        port_row.pack(fill="x", padx=20, pady=(0, 2))
+
         tk.Label(port_row, text="PORT", font=("Courier New", 9, "bold"),
                  bg=BG, fg=MUTED).pack(side="left", padx=(0, 8))
+
         self.port_var = tk.StringVar()
         self.port_cb  = ttk.Combobox(port_row, textvariable=self.port_var,
                                       style="Dark.TCombobox", state="readonly",
-                                      width=18, font=FONT_UI)
+                                      width=32, font=FONT_UI)
         self.port_cb.pack(side="left", padx=(0, 8))
-        self._btn(port_row, "⟳ REFRESH", self._refresh_ports, fg=MUTED).pack(side="left", padx=(0,8))
-        self._btn(port_row, "CONNECT",    self._connect,       fg=GREEN).pack(side="left", padx=(0,8))
-        self._btn(port_row, "DISCONNECT", self._disconnect,    fg=RED ).pack(side="left")
 
-        tk.Frame(self.root, bg=BORDER, height=1).pack(fill="x", padx=20, pady=(8,0))
+        self._btn(port_row, "⟳ REFRESH",    self._refresh_ports,  fg=MUTED ).pack(side="left", padx=(0, 8))
+        self._btn(port_row, "⚡ AUTO-DETECT", self._auto_detect,    fg=AMBER ).pack(side="left", padx=(0, 8))
+        self._btn(port_row, "CONNECT",        self._connect,        fg=GREEN ).pack(side="left", padx=(0, 8))
+        self._btn(port_row, "DISCONNECT",     self._disconnect,     fg=RED   ).pack(side="left")
+
+        # ── Chip info strip (shows after auto-detect / connect) ──
+        self.chip_var = tk.StringVar(value="")
+        self.chip_lbl = tk.Label(self.root, textvariable=self.chip_var,
+                                  font=("Courier New", 8), bg=BG, fg=AMBER, anchor="w")
+        self.chip_lbl.pack(fill="x", padx=24, pady=(0, 2))
+
+        tk.Frame(self.root, bg=BORDER, height=1).pack(fill="x", padx=20, pady=(4, 0))
 
         # ══════════════════════════════════════════════════════════════════════
         # BOTTOM — packed before editor so always visible
@@ -93,18 +123,18 @@ class ESP32KeyboardSender:
         tk.Label(delay_row, text="CHAR DELAY", font=("Courier New", 9, "bold"),
                  bg=BG, fg=MUTED).pack(side="left", padx=(0, 10))
         self.delay_var = tk.IntVar(value=50)
-        self._btn(delay_row, "−", self._delay_down, fg=RED  ).pack(side="left", padx=(0,4))
+        self._btn(delay_row, "−", self._delay_down, fg=RED  ).pack(side="left", padx=(0, 4))
         tk.Label(delay_row, textvariable=self.delay_var,
                  font=("Courier New", 11, "bold"), bg=BG, fg=GREEN,
                  width=4, anchor="center").pack(side="left")
         tk.Label(delay_row, text="ms", font=("Courier New", 9),
-                 bg=BG, fg=MUTED).pack(side="left", padx=(2,8))
-        self._btn(delay_row, "+", self._delay_up, fg=GREEN).pack(side="left", padx=(0,12))
+                 bg=BG, fg=MUTED).pack(side="left", padx=(2, 8))
+        self._btn(delay_row, "+", self._delay_up, fg=GREEN).pack(side="left", padx=(0, 12))
         tk.Scale(delay_row, from_=10, to=500, variable=self.delay_var,
                  orient="horizontal", bg=BG, fg=MUTED, troughcolor=PANEL,
                  highlightthickness=0, activebackground=GREEN,
                  showvalue=False, length=180, sliderrelief="flat",
-                 sliderlength=14).pack(side="left", padx=(0,16))
+                 sliderlength=14).pack(side="left", padx=(0, 16))
         for label, val in [("FAST 20ms", 20), ("NORMAL 50ms", 50), ("SLOW 150ms", 150)]:
             lbl = tk.Label(delay_row, text=label, font=("Courier New", 8, "bold"),
                            bg=PANEL, fg=MUTED, cursor="hand2", padx=6, pady=3)
@@ -113,7 +143,7 @@ class ESP32KeyboardSender:
             lbl.bind("<Enter>",    lambda e, w=lbl: w.configure(fg=GREEN))
             lbl.bind("<Leave>",    lambda e, w=lbl: w.configure(fg=MUTED))
 
-        # progress bar (batch only — hidden in live mode)
+        # progress bar
         self.prog_frame = tk.Frame(self.root, bg=BG)
         self.prog_frame.pack(fill="x", padx=20, pady=(0, 4), side="bottom")
         self.progress_var = tk.DoubleVar(value=0)
@@ -128,7 +158,7 @@ class ESP32KeyboardSender:
         self.btn_row = tk.Frame(self.root, bg=BG)
         self.btn_row.pack(fill="x", padx=20, pady=(0, 8), side="bottom")
         self._big_btn(self.btn_row, "⎘  PASTE", self._paste,
-                      fg=TEXT, hover="#333").pack(side="left", padx=(0,8))
+                      fg=TEXT, hover="#333").pack(side="left", padx=(0, 8))
         self.type_btn = self._big_btn(self.btn_row, "▶  START TYPING",
                                        self._start_typing, fg=BG, bg=GREEN, hover=GREEN_DIM)
         self.type_btn.pack(side="left", padx=(0, 8))
@@ -171,8 +201,7 @@ class ESP32KeyboardSender:
         ed_hdr.pack(fill="x", padx=20, pady=(6, 3))
         tk.Label(ed_hdr, text="TEXT EDITOR", font=("Courier New", 9, "bold"),
                  bg=BG, fg=MUTED).pack(side="left")
-        self.ed_hint = tk.Label(ed_hdr, text="",
-                                 font=("Courier New", 9), bg=BG, fg=MUTED)
+        self.ed_hint = tk.Label(ed_hdr, text="", font=("Courier New", 9), bg=BG, fg=MUTED)
         self.ed_hint.pack(side="left", padx=6)
 
         editor_frame = tk.Frame(self.root, bg=BORDER)
@@ -201,7 +230,6 @@ class ESP32KeyboardSender:
         self.editor.bind("<MouseWheel>", self._update_lines)
         self._update_lines()
 
-        # set initial mode
         self._set_mode("BATCH")
 
     # ── Widget helpers ─────────────────────────────────────────────────────────
@@ -234,20 +262,16 @@ class ESP32KeyboardSender:
             self.live_tab.configure(fg=AMBER, bg="#1c1500")
             self.batch_tab.configure(fg=MUTED, bg=PANEL)
             self.mode_indicator.configure(text="⚡ LIVE MODE ACTIVE", fg=AMBER)
-            self.ed_hint.configure(
-                text="— every key you press is sent to ESP32 instantly")
+            self.ed_hint.configure(text="— every key you press is sent to ESP32 instantly")
             self.editor.configure(insertbackground=AMBER)
-            # hide batch-only widgets
             self.type_btn.pack_forget()
             self.prog_frame.pack_forget()
         else:
             self.batch_tab.configure(fg=GREEN, bg="#001a0d")
             self.live_tab.configure(fg=MUTED, bg=PANEL)
             self.mode_indicator.configure(text="▶ BATCH MODE ACTIVE", fg=GREEN)
-            self.ed_hint.configure(
-                text="— prepare your text, then hit START TYPING")
+            self.ed_hint.configure(text="— prepare your text, then hit START TYPING")
             self.editor.configure(insertbackground=GREEN)
-            # show batch-only widgets (re-pack in correct order)
             self.prog_frame.pack(fill="x", padx=20, pady=(0, 4),
                                   side="bottom", before=self.btn_row)
             self.type_btn.pack(side="left", padx=(0, 8),
@@ -283,7 +307,7 @@ class ESP32KeyboardSender:
         keysym = event.keysym
         char   = event.char
 
-        # Special keys mapped to tokens the ESP32 Arduino code handles
+        # Tokens below must match the command parser implemented on the ESP32 side.
         SPECIAL = {
             "Return"    : b"[ENTER]",
             "BackSpace" : b"[BACK]",
@@ -308,31 +332,99 @@ class ESP32KeyboardSender:
                 self.serial_conn.write(b"[SPACE]\n")
                 self._log("⚡ Sent: [SPACE]")
             elif char and len(char) == 1 and 32 <= ord(char) <= 126:
-                # only printable ASCII — blocks garbage bytes like \xb0 (176)
                 self.serial_conn.write(char.encode("ascii") + b"\n")
                 self._log(f"⚡ Sent: {repr(char)}")
-            # Shift, Ctrl, F-keys etc — silently ignore
         except Exception as ex:
             self._log(f"Serial error: {ex}")
 
-    # ── Serial ─────────────────────────────────────────────────────────────────
-    def _refresh_ports(self):
-        ports = [p.device for p in serial.tools.list_ports.comports()]
-        self.port_cb["values"] = ports
-        if ports:
-            self.port_var.set(ports[0])
-            self._log(f"Found {len(ports)} port(s).")
+    # ── Port helpers ───────────────────────────────────────────────────────────
+    def _build_port_display(self, p):
+        """Return a human-readable label and the raw device for a port."""
+        chip = ESP_VIDS.get(p.vid, None)
+        if chip:
+            label = f"★ {p.device} — {chip}"     # star = likely ESP32
+        elif p.description and p.description.lower() != "n/a":
+            label = f"  {p.device} — {p.description}"
         else:
+            label = f"  {p.device}"
+        return label, p.device
+
+    def _refresh_ports(self):
+        ports = list(serial.tools.list_ports.comports())
+        self._port_map = {}
+        display_list   = []
+
+        for p in ports:
+            label, device = self._build_port_display(p)
+            self._port_map[label] = device
+            display_list.append(label)
+
+        self.port_cb["values"] = display_list
+
+        if display_list:
+            # prefer a starred (ESP32) port if present
+            esp_entries = [l for l in display_list if l.startswith("★")]
+            self.port_var.set(esp_entries[0] if esp_entries else display_list[0])
+            self._log(f"Found {len(ports)} port(s).  ★ = likely ESP32")
+        else:
+            self.port_var.set("")
             self._log("No COM ports found. Plug in ESP32.")
 
+        self.chip_var.set("")
+
+    def _auto_detect(self):
+        """Scan for first ESP32 VID, select it in dropdown, show chip info."""
+        ports = list(serial.tools.list_ports.comports())
+        for p in ports:
+            if p.vid in ESP_VIDS:
+                chip_name = ESP_VIDS[p.vid]
+                # find matching label in dropdown
+                for label, device in self._port_map.items():
+                    if device == p.device:
+                        self.port_var.set(label)
+                        break
+                vid_str = f"0x{p.vid:04X}" if p.vid else "N/A"
+                pid_str = f"0x{p.pid:04X}" if p.pid else "N/A"
+                info = (f"⚡ Auto-detected: {p.device}  |  Chip: {chip_name}  |  "
+                        f"VID: {vid_str}  PID: {pid_str}  |  S/N: {p.serial_number or 'N/A'}")
+                self.chip_var.set(info)
+                self._log(f"ESP32 found → {p.device} ({chip_name})")
+                return
+
+        # nothing found
+        self.chip_var.set("")
+        messagebox.showinfo(
+            "Auto-detect",
+            "No ESP32 found.\n\n"
+            "Checked VIDs: CP2102 (0x10C4), CH340 (0x1A86), "
+            "ESP32-S3 Native (0x303A), FTDI (0x0403).\n\n"
+            "Try: replug cable, install CH340 / CP2102 driver, "
+            "or select port manually."
+        )
+        self._log("Auto-detect: no ESP32 VID matched.")
+
+    # ── Serial ─────────────────────────────────────────────────────────────────
+    def _resolve_port(self):
+        """Convert display label → actual device path."""
+        selected = self.port_var.get()
+        return self._port_map.get(selected, selected.strip())
+
     def _connect(self):
-        port = self.port_var.get()
+        port = self._resolve_port()
         if not port:
             messagebox.showwarning("No Port", "Select a COM port first.")
             return
         try:
             self.serial_conn = serial.Serial(port, 115200, timeout=1)
             self.status_dot.configure(text=f"●  {port}", fg=GREEN)
+            # show chip info for connected port if known
+            for p in serial.tools.list_ports.comports():
+                if p.device == port and p.vid in ESP_VIDS:
+                    self.chip_var.set(
+                        f"Connected  |  {ESP_VIDS[p.vid]}  |  "
+                        f"VID: 0x{p.vid:04X}  PID: 0x{p.pid:04X}"
+                    )
+                    break
             self._log(f"Connected to {port} @ 115200 baud.")
         except Exception as ex:
             messagebox.showerror("Connection Error", str(ex))
@@ -341,6 +433,7 @@ class ESP32KeyboardSender:
         if self.serial_conn and self.serial_conn.is_open:
             self.serial_conn.close()
         self.serial_conn = None
+        self.chip_var.set("")
         self.status_dot.configure(text="●  DISCONNECTED", fg=RED)
         self._log("Disconnected.")
 
@@ -358,7 +451,7 @@ class ESP32KeyboardSender:
             self.editor.insert("end", text)
             self._update_lines()
             self._log(f"Pasted {len(text)} characters.")
-        except:
+        except Exception:
             self._log("Clipboard is empty or unavailable.")
 
     def _clear(self):
@@ -387,6 +480,7 @@ class ESP32KeyboardSender:
         self._log(f"Typing {total} characters...")
         for i, char in enumerate(text):
             try:
+                # Keep batch mode protocol identical to live mode token encoding.
                 if char == "\n":
                     self.serial_conn.write(b"[ENTER]\n")
                 elif char == " ":
@@ -399,6 +493,7 @@ class ESP32KeyboardSender:
             self.root.after(0, self.progress_var.set, min(100, (i + 1) / total * 100))
             self.root.after(0, self.prog_label.configure,
                             {"text": f"{i + 1} / {total} chars"})
+            # Delay is applied per transmitted character.
             time.sleep(self.delay_var.get() / 1000)
         self.root.after(0, self._typing_done)
 
@@ -411,6 +506,7 @@ class ESP32KeyboardSender:
 
     def _log(self, msg):
         self.log_var.set(f"● {msg}")
+
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":

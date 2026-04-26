@@ -16,8 +16,9 @@ void loop() {
 
       if (token.length() == 0) return;
 
-      // ── Special key tokens (LIVE mode) ──────────────────────
+      // ── Special key tokens ───────────────────────────────────
       if      (token == "[ENTER]") bleKeyboard.write(KEY_RETURN);
+      else if (token == "[SPACE]") bleKeyboard.write(' ');        // ← THIS WAS MISSING
       else if (token == "[BACK]" ) bleKeyboard.write(KEY_BACKSPACE);
       else if (token == "[TAB]"  ) bleKeyboard.write(KEY_TAB);
       else if (token == "[DEL]"  ) bleKeyboard.write(KEY_DELETE);
@@ -31,19 +32,11 @@ void loop() {
       else if (token == "[PGUP]" ) bleKeyboard.write(KEY_PAGE_UP);
       else if (token == "[PGDN]" ) bleKeyboard.write(KEY_PAGE_DOWN);
 
-      // ── Single printable char (LIVE mode) ───────────────────
+      // ── Single printable char ────────────────────────────────
       else if (token.length() == 1) {
         bleKeyboard.print(token[0]);
       }
-
-      // ── Full line of text (BATCH mode) ──────────────────────
-      else {
-        for (int i = 0; i < token.length(); i++) {
-          bleKeyboard.print(token[i]);
-          delay(20);  // small delay per char in batch
-        }
-        bleKeyboard.write(KEY_RETURN);
-      }
+      // unknown token → ignore silently
     }
   }
 }
