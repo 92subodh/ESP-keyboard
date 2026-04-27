@@ -374,6 +374,7 @@ class ESP32KeyboardSender:
 
     def _auto_detect(self):
         """Scan for first ESP32 VID, select it in dropdown, show chip info."""
+        self._refresh_ports()
         ports = list(serial.tools.list_ports.comports())
         for p in ports:
             if p.vid in ESP_VIDS:
