@@ -4,6 +4,7 @@ import serial
 import serial.tools.list_ports
 import threading
 import time
+import random
 
 # ── Theme ──────────────────────────────────────────────────────────────────────
 BG        = "#0d0d0d"
@@ -47,6 +48,7 @@ class ESP32KeyboardSender:
 
         self.serial_conn = None
         self.is_typing   = False
+        self.stop_typing_flag = False
         self.live_mode   = False
         self._port_map   = {}   # display label → actual device path
 
@@ -142,6 +144,16 @@ class ESP32KeyboardSender:
             lbl.bind("<Button-1>", lambda e, v=val: self.delay_var.set(v))
             lbl.bind("<Enter>",    lambda e, w=lbl: w.configure(fg=GREEN))
             lbl.bind("<Leave>",    lambda e, w=lbl: w.configure(fg=MUTED))
+            
+        self.humanize_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(delay_row, text="🧍 HUMANIZE", variable=self.humanize_var,
+                       font=("Courier New", 9, "bold"), bg=BG, fg=AMBER,
+                       selectcolor=PANEL, activebackground=BG, activeforeground=AMBER).pack(side="left", padx=(10, 0))
+                       
+        self.smart_ide_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(delay_row, text="🧠 SMART IDE", variable=self.smart_ide_var,
+                       font=("Courier New", 9, "bold"), bg=BG, fg=GREEN,
+                       selectcolor=PANEL, activebackground=BG, activeforeground=GREEN).pack(side="left", padx=(10, 0))
 
         # progress bar
         self.prog_frame = tk.Frame(self.root, bg=BG)
@@ -162,8 +174,13 @@ class ESP32KeyboardSender:
         self.type_btn = self._big_btn(self.btn_row, "▶  START TYPING",
                                        self._start_typing, fg=BG, bg=GREEN, hover=GREEN_DIM)
         self.type_btn.pack(side="left", padx=(0, 8))
-        self._big_btn(self.btn_row, "✕  CLEAR", self._clear,
-                      fg=RED, hover="#200").pack(side="left")
+        
+        self.stop_btn = self._big_btn(self.btn_row, "⏹  STOP TYPING",
+                                      self._stop_typing, fg=BG, bg=RED, hover="#cc0000")
+        
+        self.clear_btn = self._big_btn(self.btn_row, "✕  CLEAR", self._clear,
+                      fg=RED, hover="#200")
+        self.clear_btn.pack(side="left")
 
         # ══════════════════════════════════════════════════════════════════════
         # MODE TOGGLE BAR
@@ -265,6 +282,7 @@ class ESP32KeyboardSender:
             self.ed_hint.configure(text="— every key you press is sent to ESP32 instantly")
             self.editor.configure(insertbackground=AMBER)
             self.type_btn.pack_forget()
+            self.stop_btn.pack_forget()
             self.prog_frame.pack_forget()
         else:
             self.batch_tab.configure(fg=GREEN, bg="#001a0d")
@@ -274,8 +292,12 @@ class ESP32KeyboardSender:
             self.editor.configure(insertbackground=GREEN)
             self.prog_frame.pack(fill="x", padx=20, pady=(0, 4),
                                   side="bottom", before=self.btn_row)
-            self.type_btn.pack(side="left", padx=(0, 8),
-                                after=self.btn_row.winfo_children()[0])
+            if self.is_typing:
+                self.stop_btn.pack(side="left", padx=(0, 8),
+                                   after=self.btn_row.winfo_children()[0])
+            else:
+                self.type_btn.pack(side="left", padx=(0, 8),
+                                   after=self.btn_row.winfo_children()[0])
 
         self._log(f"Mode: {'LIVE — type to send' if self.live_mode else 'BATCH — use START TYPING'}")
 
@@ -462,6 +484,57 @@ class ESP32KeyboardSender:
         self._update_lines()
         self._log("Editor cleared.")
 
+    def _stop_typing(self):
+        if not self.is_typing:
+            return
+        self.stop_typing_flag = True
+        self._log("Stopping...")
+
+    def _apply_smart_ide(self, text):
+        lines = text.split('\n')
+        
+        # Detect indent size (default 4)
+        indent_size = 4
+        for line in lines:
+            spaces = len(line) - len(line.lstrip(' '))
+            if spaces > 0:
+                if spaces % 2 == 0 and spaces < 4:
+                    indent_size = 2
+                break
+                
+        processed_lines = []
+        ide_level = 0
+        
+        for line in lines:
+            if not line.strip():
+                processed_lines.append("")
+                continue
+                
+            leading_spaces = 0
+            for char in line:
+                if char == ' ': leading_spaces += 1
+                elif char == '\t': leading_spaces += indent_size
+                else: break
+                
+            target_level = leading_spaces // indent_size
+            
+            out_line = ""
+            if target_level < ide_level:
+                out_line += "\b" * (ide_level - target_level)
+            elif target_level > ide_level:
+                out_line += " " * ((target_level - ide_level) * indent_size)
+                
+            out_line += line.lstrip(' \t')
+            processed_lines.append(out_line)
+            
+            # Predict IDE's next auto-indent
+            ide_level = target_level
+            stripped = line.strip()
+            if stripped.endswith(':') or stripped.endswith('{') or stripped.endswith('['):
+                ide_level += 1
+                
+        return '\n'.join(processed_lines)
+
     def _start_typing(self):
         if self.is_typing:
             return
@@ -472,38 +545,111 @@ class ESP32KeyboardSender:
         if not text.strip():
             messagebox.showwarning("Empty", "Nothing to type.")
             return
+            
+        if self.smart_ide_var.get():
+            text = self._apply_smart_ide(text)
         self.is_typing = True
-        self.type_btn.configure(bg="#333")
+        self.stop_typing_flag = False
+        
+        self.type_btn.pack_forget()
+        self.stop_btn.pack(side="left", padx=(0, 8), after=self.btn_row.winfo_children()[0])
+        
         threading.Thread(target=self._type_worker, args=(text,), daemon=True).start()
 
     def _type_worker(self, text):
         total = len(text)
         self._log(f"Typing {total} characters...")
+        stopped = False
+        
+        # A simple adjacency map for simulating typos (QWERTY)
+        adj_keys = {
+            'a': 'qwsz', 'b': 'vghn', 'c': 'xdfv', 'd': 'ersfxc', 'e': 'wsdr34',
+            'f': 'rtgdcv', 'g': 'tyfvhb', 'h': 'yugjbn', 'i': 'uokj89', 'j': 'uikhnm',
+            'k': 'ijolm', 'l': 'okp', 'm': 'njk', 'n': 'bhjm', 'o': 'iklp90',
+            'p': 'ol0', 'q': 'wa12', 'r': 'edft45', 's': 'awedxz', 't': 'rfgy56',
+            'u': 'yhij78', 'v': 'cfgb', 'w': 'qase23', 'x': 'zsdc', 'y': 'tghu67', 'z': 'asx'
+        }
+        
+        def _send(c):
+            if c == "\n":
+                self.serial_conn.write(b"[ENTER]\n")
+            elif c == " ":
+                self.serial_conn.write(b"[SPACE]\n")
+            elif c == "\b":
+                self.serial_conn.write(b"[BACK]\n")
+            elif 32 <= ord(c) <= 126:
+                self.serial_conn.write(c.encode("ascii") + b"\n")
+
         for i, char in enumerate(text):
+            if self.stop_typing_flag:
+                stopped = True
+                break
+                
+            is_humanize = self.humanize_var.get()
+            base_delay = self.delay_var.get()
+            
             try:
-                # Keep batch mode protocol identical to live mode token encoding.
-                if char == "\n":
-                    self.serial_conn.write(b"[ENTER]\n")
-                elif char == " ":
-                    self.serial_conn.write(b"[SPACE]\n")
-                elif 32 <= ord(char) <= 126:
-                    self.serial_conn.write(char.encode("ascii") + b"\n")
+                # Occasional simulated typo
+                if is_humanize and char.lower() in adj_keys and random.random() < 0.015:  # 1.5% typo chance
+                    wrong_char = random.choice(adj_keys[char.lower()])
+                    if char.isupper():
+                        wrong_char = wrong_char.upper()
+                        
+                    _send(wrong_char)
+                    # Human reaction time to typo
+                    time.sleep(random.uniform(0.15, 0.3))
+                    
+                    _send("\b")
+                    # Small pause after backspace
+                    time.sleep(random.uniform(0.05, 0.15))
+
+                # Send the actual character
+                _send(char)
+                
             except Exception as ex:
                 self._log(f"Serial error: {ex}")
                 break
+                
             self.root.after(0, self.progress_var.set, min(100, (i + 1) / total * 100))
             self.root.after(0, self.prog_label.configure,
                             {"text": f"{i + 1} / {total} chars"})
-            # Delay is applied per transmitted character.
-            time.sleep(self.delay_var.get() / 1000)
-        self.root.after(0, self._typing_done)
+            
+            # Calculate humanized delay
+            if is_humanize:
+                # 1. Jitter (Random variability +/- 40%)
+                delay = base_delay * random.uniform(0.6, 1.4)
+                
+                # 2. Contextual Pauses
+                if char in [' ', '.', ',', '?', '!']:
+                    delay *= random.uniform(1.2, 1.8) # Pause after words/sentences
+                elif char.isupper() or char in ['@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '"', ':']:
+                    delay *= random.uniform(1.3, 1.7) # Extra time to coordinate Shift key
+                elif char == '\n':
+                    delay *= random.uniform(2.0, 4.0) # Long pause on Enter
+                
+                # 3. Burst typing for lowercases
+                if char.islower():
+                    delay *= 0.85
+                    
+                time.sleep(delay / 1000.0)
+            else:
+                time.sleep(base_delay / 1000.0)
+                
+        self.root.after(0, self._typing_done, stopped)
 
-    def _typing_done(self):
+    def _typing_done(self, stopped=False):
         self.is_typing = False
-        self.progress_var.set(100)
-        self._log("✓ Done typing!")
-        self.type_btn.configure(bg=GREEN)
-        self.root.after(2000, lambda: self.progress_var.set(0))
+        
+        self.stop_btn.pack_forget()
+        if not self.live_mode:
+            self.type_btn.pack(side="left", padx=(0, 8), after=self.btn_row.winfo_children()[0])
+            
+        if stopped:
+            self._log("Typing stopped by user.")
+        else:
+            self.progress_var.set(100)
+            self._log("✓ Done typing!")
+            self.root.after(2000, lambda: self.progress_var.set(0))
 
     def _log(self, msg):
         self.log_var.set(f"● {msg}")
